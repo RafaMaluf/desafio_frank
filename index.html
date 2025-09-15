@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conversor de Formas Normais Prenex</title>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      line-height: 1.4;
+      background-color: #fefefe;
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 1rem;
+    }
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      padding: 10px;
+      font-size: 1rem;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      resize: vertical;
+    }
+    button {
+      margin-top: 10px;
+      padding: 8px 16px;
+      font-size: 1rem;
+      background-color: #2d7dd2;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #1e62a5;
+    }
+    .output {
+      margin-top: 20px;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      background-color: #fafafa;
+    }
+    .label {
+      font-weight: bold;
+      margin-bottom: 5px;
+      display: block;
+    }
+    .formula {
+      font-family: monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background-color: #f9f9f9;
+      padding: 10px;
+      border: 1px solid #eee;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Conversor de Formas Normais Prenex</h1>
+  <p>Digite uma fórmula em LaTeX. A fórmula será convertida para:</p>
+  <ul>
+    <li>Forma Normal Conjuntiva Prenex</li>
+    <li>Forma Normal Disjuntiva Prenex</li>
+    <li>Forma Cláusal </li>
+    <li>Cláusula de Horn</li>
+  </ul>
+  <textarea id="input" placeholder="Exemplo: \forall x\; \exists y\; (P(x,y) \to (Q(y) \wedge R(x)))"></textarea>
+  <br>
+  <button onclick="processFormula()">Converter</button>
+
+  <div id="rendered" class="output"></div>
+  <div id="fncPrenex" class="output"></div>
+  <div id="fndPrenex" class="output"></div>
+  <div id="clausal" class="output"></div>
+  <div id="horn" class="output"></div>
+
+  <script>
+    // Classe Node para representar diferentes tipos de nó no AST.
+    class Node {
+      constructor(type, props) {
+        this.type = type;
+        Object.assign(this, props);
+      }
+    }
+
+    // Função para gerar identificadores únicos (variáveis, funções)
+    const IdGenerator = () => {
+      let counter = 0;
+      return (prefix) => {
+        counter += 1;
+        return `${prefix}${counter}`;
+      };
+    };
+    const newVar = IdGenerator();
+    const newFun = IdGenerator();
+
+    /**
+     * Normaliza a string de LaTeX para uma forma mais simples a ser
+     * tokenizada. Substitui comandos como \wedge por ∧, \vee por ∨, etc.
+     * Remove \left e \right, que não afetam a semântica.
+     */
+    function normalizeLatex(str) {
+      // Remove comandos \left e \right apenas quando não fazem
+      // parte de comandos maiores (como \leftrightarrow). Isso é feito
+      // através de uma negação que verifica se o caractere seguinte é uma letra.
+      return str
+        .replace(/\\left(?![a-zA-Z])/g, '')
+        .replace(/\\right(?![a-zA-Z])/g, '')
+        // substituições de operadores e quantificadores; padrões mais longos primeiro
+        .replace(/\\leftrightarrow/g, ' ↔ ')
+        .replace(/\\iff/g, ' ↔ ')
+        // seta para a direita: suportar variantes de escrita e seta dupla
+        .replace(/\\rightarrow/g, ' → ')
+        .replace(/\\rightarrow/g, ' → ')
+        // alguns usuários escrevem incorretamente \rightarrow (faltando g), tratar também
+        .replace(/\\rightarrow/g, ' → ')
+        .replace(/\\to/g, ' → ')
+        .replace(/\\Rightarrow/g, ' ⇒ ')
+        .replace(/\\land/g, ' ∧ ')
+        .replace(/\\wedge/g, ' ∧ ')
+        .replace(/\\lor/g, ' ∨ ')
+        .replace(/\\vee/g, ' ∨ ')
+        .replace(/\\neg/g, ' ¬ ')
+        .replace(/\\lnot/g, ' ¬ ')
+        .replace(/\\forall/g, ' ∀ ')
+        .replace(/\\exists/g, ' ∃ ')
+        .replace(/\\,/g, ',')
+        .replace(/\\ /g, ' ')
+        .replace(/;/g, ' ') // Remove ponto e vírgula usado como separador
+        .replace(/\s+/g, ' ')  // Remove espaços extras
+        .trim();
+    }
+
+    /**
+     * Tokeniza a string normalizada em uma lista de tokens. Os tokens podem
+     * ser símbolos lógicos, parênteses, quantificadores ou nomes (predicados,
+     * funções, variáveis).
+     */
+    function tokenize(str) {
+      const tokens = [];
+      let i = 0;
+      while (i < str.length) {
+        const ch = str[i];
+        if (ch === ' ') { i++; continue; }
+        // parênteses
+        if (ch === '(' || ch === ')' || ch === ',' ) {
+          tokens.push({ type: ch });
+          i++;
+          continue;
+        }
+        // conectivos de dois caracteres
+        if (ch === '¬') { tokens.push({ type: 'NOT' }); i++; continue; }
+        if (ch === '∧') { tokens.push({ type: 'AND' }); i++; continue; }
+        if (ch === '∨') { tokens.push({ type: 'OR' }); i++; continue; }
+        if (ch === '→' || ch === '⇒') { tokens.push({ type: 'IMPLIES' }); i++; continue; }
+        if (ch === '↔') { tokens.push({ type: 'IFF' }); i++; continue; }
+        if (ch === '∀') { tokens.push({ type: 'FORALL' }); i++; continue; }
+        if (ch === '∃') { tokens.push({ type: 'EXISTS' }); i++; continue; }
+        // Símbolos alfanuméricos (nomes, variáveis, funções). Também tratamos
+        // o sinal de menos como parte de nomes, permitindo termos como "-x".
+        if (/\w/.test(ch) || ch === '\\' || ch === '-') {
+          let start = i;
+          // Avança enquanto os caracteres forem alfanuméricos, underscore,
+          // backslash ou sinal de menos. Isso agrupa "-x" e outros nomes com '-'.
+          while (i < str.length && (/\w/.test(str[i]) || str[i] === '_' || str[i] === '\\' || str[i] === '-')) {
+            i++;
+          }
+          const name = str.slice(start, i);
+          // Se for um comando LaTeX começando com \\, verificar e converter.
+          if (name.startsWith('\\')) {
+            // Remove todos os backslashes iniciais para obter apenas o comando
+            const cmd = name.replace(/^\\+/, '');
+            const cmdLower = cmd.toLowerCase();
+          // Bicondicional: \leftrightarrow ou \iff ou variantes com "lef" e "right"
+            // Normalmente o comando correto é \leftrightarrow, mas alguns usuários
+            // podem escrever variantes como \leftrightarrow, \leftright, etc.
+            // Se o nome contém "lef" e "right", assumimos que é bicondicional.
+            if ((cmdLower.includes('lef') && cmdLower.includes('right')) || cmdLower === 'iff') {
+              tokens.push({ type: 'IFF' });
+              continue;
+            }
+            // Implicação: \to, \rightarrow, \Rightarrow, \hookrightarrow, etc.
+            if (cmdLower === 'to' || (cmdLower.includes('arrow') && !cmdLower.includes('lef')) || cmdLower.startsWith('right')) {
+              tokens.push({ type: 'IMPLIES' });
+              continue;
+            }
+            // Conjunção: \land ou \wedge
+            if (cmdLower === 'land' || cmdLower === 'wedge') {
+              tokens.push({ type: 'AND' });
+              continue;
+            }
+            // Disjunção: \lor ou \vee
+            if (cmdLower === 'lor' || cmdLower === 'vee') {
+              tokens.push({ type: 'OR' });
+              continue;
+            }
+            // Negação: \neg ou \lnot
+            if (cmdLower === 'neg' || cmdLower === 'lnot') {
+              tokens.push({ type: 'NOT' });
+              continue;
+            }
+            // Quantificadores
+            if (cmdLower === 'forall') {
+              tokens.push({ type: 'FORALL' });
+              continue;
+            }
+            if (cmdLower === 'exists') {
+              tokens.push({ type: 'EXISTS' });
+              continue;
+            }
+            // Se o comando não for reconhecido, deixa como nome comum abaixo
+          }
+          // Se não começar com barra, ainda pode ser um comando de seta que perdeu a barra na normalização
+          const lower = name.toLowerCase();
+          if (lower === 'to' || (lower.endsWith('arrow') && !lower.includes('lef'))) {
+            tokens.push({ type: 'IMPLIES' });
+            continue;
+          }
+          tokens.push({ type: 'NAME', value: name });
+          continue;
+        }
+        // Qualquer outro caractere é considerado literal
+        tokens.push({ type: ch });
+        i++;
+      }
+      return tokens;
+    }
+
+    /**
+     * Analisador sintático recursivo que consome tokens e constrói o AST.
+     * Implementa precedência dos operadores: NOT > AND > OR > IMPLIES > IFF.
+     * Suporta quantificadores ∀ e ∃ imediatamente seguidos de variável(s).
+     */
+    function parse(tokens) {
+      let position = 0;
+
+      function peek() {
+        // Ignora vírgulas fora de contextos específicos (tratadas em parseTerm)
+        skipCommas();
+        return tokens[position];
+      }
+      function consume(expectedType) {
+        const tok = tokens[position];
+        if (!tok) throw new Error('Token inesperado: esperado ' + expectedType + ', mas encontrado fim.');
+        if (expectedType && tok.type !== expectedType) {
+          throw new Error('Token inesperado: esperado ' + expectedType + ', mas encontrado ' + tok.type);
+        }
+        position++;
+        return tok;
+      }
+
+      function skipCommas() {
+        // pula vírgulas redundantes que separam quantificadores ou expressões
+        while (tokens[position] && tokens[position].type === ',') {
+          position++;
+        }
+      }
+
+      // Análise de termos (predicados/variáveis e quantificadores)
+      function parsePrimary() {
+        skipCommas();
+        const tok = peek();
+        if (!tok) throw new Error('Token inesperado: fim de entrada');
+        if (tok.type === 'NOT') {
+          consume('NOT');
+          return new Node('not', { operand: parsePrimary() });
+        }
+        if (tok.type === 'FORALL' || tok.type === 'EXISTS') {
+          const type = tok.type === 'FORALL' ? 'forall' : 'exists';
+          consume(tok.type);
+          // Após quantificador podem vir uma ou mais variáveis. No entanto,
+          // queremos evitar confundir o início da fórmula (predicados) com
+          // variáveis. Em lógica de predicados, convencionamos que nomes de
+          // variáveis iniciam com letra minúscula, enquanto predicados e
+          // funções iniciam com letra maiúscula. Assim, só consumimos
+          // identificadores que começam com letra minúscula como variáveis.
+          const vars = [];
+          while (true) {
+            skipCommas();
+            const nextTok = peek();
+            if (nextTok && nextTok.type === 'NAME' && /^[a-z]/.test(nextTok.value)) {
+              vars.push(nextTok.value);
+              consume('NAME');
+            } else {
+              break;
+            }
+          }
+          // Se não encontramos nenhuma variável (ex: \forall P(x)), lançamos
+          // um erro para indicar sintaxe incorreta.
+          if (vars.length === 0) {
+            throw new Error('Esperado pelo menos uma variável após quantificador');
+          }
+          // Em seguida deve haver uma fórmula
+          const formula = parsePrimary();
+          // Se houver várias variáveis quantificadas, aninha quantificadores
+          let node = formula;
+          for (let i = vars.length - 1; i >= 0; i--) {
+            node = new Node(type, { var: vars[i], formula: node });
+          }
+          return node;
+        }
+        if (tok.type === '(') {
+          consume('(');
+          const expr = parseExpression();
+          consume(')');
+          return expr;
+        }
+        if (tok.type === 'NAME') {
+          // Pode ser predicado com argumentos ou variável simples
+          const name = consume('NAME').value;
+          if (peek() && peek().type === '(') {
+            consume('(');
+            const args = [];
+            while (true) {
+              skipCommas();
+              if (peek() && peek().type === ')') break;
+              args.push(parseTerm());
+              skipCommas();
+              if (peek() && peek().type === ',') consume(',');
+              else {
+                // se não há vírgula, continua
+              }
+            }
+            consume(')');
+            return new Node('atom', { name, args });
+          }
+          // variável ou constante sem argumentos
+          return new Node('atom', { name, args: [] });
+        }
+        throw new Error('Token inesperado: ' + tok.type);
+      }
+
+      // Termos são variáveis, constantes ou funções aplicadas a termos
+      function parseTerm() {
+          skipCommas();
+          const tok = peek();
+          if (!tok) throw new Error('Termo inesperado: fim de entrada');
+          if (tok.type === 'NAME') {
+            const raw = consume('NAME').value;
+            // Se o nome começa com '-' e tem mais de um caractere, interpreta
+            // como função unária 'neg' aplicada ao restante. Isso permite
+            // escrever termos como -x, -y ou -1.
+            if (raw.startsWith('-') && raw.length > 1) {
+              const innerName = raw.slice(1);
+              // Trata o restante como um termo simples (variável ou constante)
+              let arg;
+              // Se innerName começar com dígito, tratamos como constante
+              if (/^\d+$/.test(innerName)) {
+                arg = { type: 'variable', name: innerName };
+              } else {
+                arg = { type: 'variable', name: innerName };
+              }
+              return { type: 'function', name: 'neg', args: [arg] };
+            }
+            const name = raw;
+            if (peek() && peek().type === '(') {
+              consume('(');
+              const args = [];
+              while (true) {
+                skipCommas();
+                if (peek() && peek().type === ')') break;
+                args.push(parseTerm());
+                skipCommas();
+                if (peek() && peek().type === ',') consume(',');
+                else {
+                  // continua se não há vírgula
+                }
+              }
+              consume(')');
+              return { type: 'function', name, args };
+            }
+            // variável/constante
+            return { type: 'variable', name };
+          }
+          throw new Error('Termo inesperado: ' + tok.type);
+      }
+
+      // Operadores binários por precedência. IFF é o mais baixo.
+      function parseExpression() {
+        return parseIff();
+      }
+
+      function parseIff() {
+        let node = parseImplies();
+        while (true) {
+          skipCommas();
+          if (peek() && peek().type === 'IFF') {
+            consume('IFF');
+            const right = parseImplies();
+            node = new Node('iff', { left: node, right });
+          } else {
+            break;
+          }
+        }
+        return node;
+      }
+
+      function parseImplies() {
+        let node = parseOr();
+        while (true) {
+          skipCommas();
+          if (peek() && peek().type === 'IMPLIES') {
+            consume('IMPLIES');
+            const right = parseOr();
+            node = new Node('implies', { left: node, right });
+          } else {
+            break;
+          }
+        }
+        return node;
+      }
+
+      function parseOr() {
+        let node = parseAnd();
+        while (true) {
+          skipCommas();
+          if (peek() && peek().type === 'OR') {
+            consume('OR');
+            const right = parseAnd();
+            node = new Node('or', { left: node, right });
+          } else {
+            break;
+          }
+        }
+        return node;
+      }
+
+      function parseAnd() {
+        let node = parsePrimary();
+        while (true) {
+          skipCommas();
+          if (peek() && peek().type === 'AND') {
+            consume('AND');
+            const right = parsePrimary();
+            node = new Node('and', { left: node, right });
+          } else {
+            break;
+          }
+        }
+        return node;
+      }
+
+      const result = parseExpression();
+      if (position < tokens.length) {
+        throw new Error('Entrada não totalmente consumida. Posição ' + position);
+      }
+        return result;
+    }
+
+    /**
+     * Substitui todas as ocorrências de uma variável em um nó por um termo.
+     */
+    function substitute(node, varName, term) {
+      if (!node) return node;
+      switch (node.type) {
+        case 'atom': {
+          const args = node.args.map(arg => substituteTerm(arg, varName, term));
+          return new Node('atom', { name: node.name, args });
+        }
+        case 'not': {
+          return new Node('not', { operand: substitute(node.operand, varName, term) });
+        }
+        case 'and':
+        case 'or':
+        case 'implies':
+        case 'iff': {
+          return new Node(node.type, {
+            left: substitute(node.left, varName, term),
+            right: substitute(node.right, varName, term)
+          });
+        }
+        case 'forall':
+        case 'exists': {
+          // se o quantificador amarra a mesma variável, não substituir dentro
+          if (node.var === varName) return node;
+          return new Node(node.type, { var: node.var, formula: substitute(node.formula, varName, term) });
+        }
+        default:
+          return node;
+      }
+    }
+
+    function substituteTerm(t, varName, term) {
+      if (t.type === 'variable') {
+        if (t.name === varName) {
+          return term;
+        }
+        return { ...t };
+      }
+      if (t.type === 'function') {
+        return {
+          type: 'function',
+          name: t.name,
+          args: t.args.map(a => substituteTerm(a, varName, term))
+        };
+      }
+      return t;
+    }
+
+    /**
+     * Retorna o conjunto de variáveis livres em um nó. boundSet contém as
+     * variáveis já ligadas por quantificadores acima.
+     */
+    function freeVars(node, boundSet = new Set()) {
+      const result = new Set();
+      switch (node.type) {
+        case 'atom':
+          node.args.forEach(arg => collectVarsInTerm(arg, result, boundSet));
+          return result;
+        case 'not':
+          return freeVars(node.operand, boundSet);
+        case 'and':
+        case 'or':
+        case 'implies':
+        case 'iff': {
+          const left = freeVars(node.left, boundSet);
+          const right = freeVars(node.right, boundSet);
+          left.forEach(v => result.add(v));
+          right.forEach(v => result.add(v));
+          return result;
+        }
+        case 'forall':
+        case 'exists': {
+          const newBound = new Set(boundSet);
+          newBound.add(node.var);
+          const sub = freeVars(node.formula, newBound);
+          sub.forEach(v => result.add(v));
+          return result;
+        }
+      }
+      return result;
+    }
+
+    function collectVarsInTerm(t, resultSet, boundSet) {
+      if (t.type === 'variable') {
+        if (!boundSet.has(t.name)) {
+          resultSet.add(t.name);
+        }
+      } else if (t.type === 'function') {
+        t.args.forEach(arg => collectVarsInTerm(arg, resultSet, boundSet));
+      }
+    }
+
+    /**
+     * Elimina equivalências (↔) e implicações (→) da árvore.
+     */
+    function eliminateImplications(node) {
+      if (!node) return node;
+      switch (node.type) {
+        case 'iff': {
+          // A ↔ B  ≡  (A → B) ∧ (B → A)
+          // Primeiro elimina implicações nos operandos
+          const left = eliminateImplications(node.left);
+          const right = eliminateImplications(node.right);
+          // Em seguida, constrói as duas implicações e as elimina recursivamente
+          const leftImp = eliminateImplications(new Node('implies', { left, right }));
+          const rightImp = eliminateImplications(new Node('implies', { left: right, right: left }));
+          return new Node('and', { left: leftImp, right: rightImp });
+        }
+        case 'implies': {
+          // A → B  ≡  ¬A ∨ B
+          return new Node('or', { left: new Node('not', { operand: eliminateImplications(node.left) }), right: eliminateImplications(node.right) });
+        }
+        case 'and':
+        case 'or': {
+          return new Node(node.type, { left: eliminateImplications(node.left), right: eliminateImplications(node.right) });
+        }
+        case 'not': {
+          return new Node('not', { operand: eliminateImplications(node.operand) });
+        }
+        case 'forall':
+        case 'exists': {
+          return new Node(node.type, { var: node.var, formula: eliminateImplications(node.formula) });
+        }
+        case 'atom':
+          return node;
+      }
+    }
+
+    /**
+     * Move as negações para a forma normal negativa (NNF). As negações são
+     * movidas para imediatamente antes de átomos, aplicando as leis de De
+     * Morgan e transformando quantificadores conforme necessário.
+     */
+    function toNNF(node) {
+      if (!node) return node;
+      switch (node.type) {
+        case 'not': {
+          const operand = node.operand;
+          if (operand.type === 'not') {
+            // ¬¬A => A
+            return toNNF(operand.operand);
+          }
+          if (operand.type === 'and') {
+            // ¬(A ∧ B) => ¬A ∨ ¬B
+            return new Node('or', { left: toNNF(new Node('not', { operand: operand.left })), right: toNNF(new Node('not', { operand: operand.right })) });
+          }
+          if (operand.type === 'or') {
+            // ¬(A ∨ B) => ¬A ∧ ¬B
+            return new Node('and', { left: toNNF(new Node('not', { operand: operand.left })), right: toNNF(new Node('not', { operand: operand.right })) });
+          }
+          if (operand.type === 'forall') {
+            // ¬∀x A => ∃x ¬A
+            return new Node('exists', { var: operand.var, formula: toNNF(new Node('not', { operand: operand.formula })) });
+          }
+          if (operand.type === 'exists') {
+            // ¬∃x A => ∀x ¬A
+            return new Node('forall', { var: operand.var, formula: toNNF(new Node('not', { operand: operand.formula })) });
+          }
+          // caso base: ¬p é mantido onde p é átomo
+          return new Node('not', { operand: toNNF(operand) });
+        }
+        case 'and':
+        case 'or': {
+          return new Node(node.type, { left: toNNF(node.left), right: toNNF(node.right) });
+        }
+        case 'forall':
+        case 'exists': {
+          return new Node(node.type, { var: node.var, formula: toNNF(node.formula) });
+        }
+        default:
+          return node;
+      }
+    }
+
+    /**
+     * Renomeia variáveis ligadas por quantificadores para evitar colisões.
+     * Cada quantificador recebe um novo nome único.
+     */
+    function standardize(node, mapping = new Map()) {
+      if (!node) return node;
+      switch (node.type) {
+        case 'forall':
+        case 'exists': {
+          const newName = newVar('v');
+          const newMap = new Map(mapping);
+          newMap.set(node.var, newName);
+          const renamedSub = standardize(node.formula, newMap);
+          return new Node(node.type, { var: newName, formula: renamedSub });
+        }
+        case 'not': {
+          return new Node('not', { operand: standardize(node.operand, mapping) });
+        }
+        case 'and':
+        case 'or':
+        case 'implies':
+        case 'iff': {
+          return new Node(node.type, { left: standardize(node.left, mapping), right: standardize(node.right, mapping) });
+        }
+        case 'atom': {
+          // renomear variáveis em argumentos
+          const args = node.args.map(arg => renameTerm(arg, mapping));
+          return new Node('atom', { name: node.name, args });
+        }
+      }
+    }
+
+    function renameTerm(term, mapping) {
+      if (term.type === 'variable') {
+        return { type: 'variable', name: mapping.get(term.name) || term.name };
+      }
+      if (term.type === 'function') {
+        return {
+          type: 'function',
+          name: term.name,
+          args: term.args.map(arg => renameTerm(arg, mapping))
+        };
+      }
+      return term;
+    }
+
+    /**
+     * Constrói a representação prenex de uma fórmula (quantificadores ao início).
+     * Retorna um objeto com a lista de quantificadores e a matriz (parte sem
+     * quantificadores).
+     */
+    function toPrenex(node) {
+      // Se o nó for quantificador, apenas acumular e continuar
+      if (node.type === 'forall' || node.type === 'exists') {
+        const result = toPrenex(node.formula);
+        return {
+          quantifiers: [{ type: node.type, var: node.var }, ...result.quantifiers],
+          matrix: result.matrix
+        };
+      }
+      if (node.type === 'and' || node.type === 'or') {
+        const left = toPrenex(node.left);
+        const right = toPrenex(node.right);
+        let quantifiers = [];
+        let leftMatrix = left.matrix;
+        let rightMatrix = right.matrix;
+        // Mover quantificadores da esquerda
+        left.quantifiers.forEach(q => {
+          // se a variável ocorre livre na direita, renomear na esquerda
+          const fvRight = freeVars(rightMatrix);
+          if (fvRight.has(q.var)) {
+            const newName = newVar('v');
+            leftMatrix = substitute(leftMatrix, q.var, { type: 'variable', name: newName });
+            quantifiers.push({ type: q.type, var: newName });
+          } else {
+            quantifiers.push(q);
+          }
+        });
+        // Mover quantificadores da direita
+        right.quantifiers.forEach(q => {
+          const fvLeft = freeVars(leftMatrix);
+          if (fvLeft.has(q.var)) {
+            const newName = newVar('v');
+            rightMatrix = substitute(rightMatrix, q.var, { type: 'variable', name: newName });
+            quantifiers.push({ type: q.type, var: newName });
+          } else {
+            quantifiers.push(q);
+          }
+        });
+        const newMatrix = new Node(node.type, { left: leftMatrix, right: rightMatrix });
+        return { quantifiers, matrix: newMatrix };
+      }
+      if (node.type === 'not') {
+        const sub = toPrenex(node.operand);
+        return { quantifiers: sub.quantifiers, matrix: new Node('not', { operand: sub.matrix }) };
+      }
+      // átomo
+      return { quantifiers: [], matrix: node };
+    }
+
+    /**
+     * Distribui disjunções sobre conjunções para gerar a Forma Normal Conjuntiva
+     * (CNF). Assume que a fórmula está na NNF. Use distributividade: A ∨ (B ∧ C)
+     * = (A ∨ B) ∧ (A ∨ C).
+     */
+    function toCNF(node) {
+      node = distributeOr(node);
+      return node;
+    }
+
+    function distributeOr(node) {
+      if (!node) return node;
+      if (node.type === 'or') {
+        const left = distributeOr(node.left);
+        const right = distributeOr(node.right);
+        // se qualquer lado é conjunção, distribuir
+        if (left.type === 'and') {
+          return new Node('and', {
+            left: distributeOr(new Node('or', { left: left.left, right })),
+            right: distributeOr(new Node('or', { left: left.right, right }))
+          });
+        }
+        if (right.type === 'and') {
+          return new Node('and', {
+            left: distributeOr(new Node('or', { left, right: right.left })),
+            right: distributeOr(new Node('or', { left, right: right.right }))
+          });
+        }
+        return new Node('or', { left, right });
+      }
+      if (node.type === 'and') {
+        return new Node('and', { left: distributeOr(node.left), right: distributeOr(node.right) });
+      }
+      if (node.type === 'not') {
+        return new Node('not', { operand: distributeOr(node.operand) });
+      }
+      return node;
+    }
+
+    /**
+     * Distribui conjunções sobre disjunções para gerar a Forma Normal Disjuntiva
+     * (DNF). Assume que a fórmula está na NNF.
+     */
+    function toDNF(node) {
+      node = distributeAnd(node);
+      return node;
+    }
+
+    function distributeAnd(node) {
+      if (!node) return node;
+      if (node.type === 'and') {
+        const left = distributeAnd(node.left);
+        const right = distributeAnd(node.right);
+        // se qualquer lado é disjunção, distribuir
+        if (left.type === 'or') {
+          return new Node('or', {
+            left: distributeAnd(new Node('and', { left: left.left, right })),
+            right: distributeAnd(new Node('and', { left: left.right, right }))
+          });
+        }
+        if (right.type === 'or') {
+          return new Node('or', {
+            left: distributeAnd(new Node('and', { left, right: right.left })),
+            right: distributeAnd(new Node('and', { left, right: right.right }))
+          });
+        }
+        return new Node('and', { left, right });
+      }
+      if (node.type === 'or') {
+        return new Node('or', { left: distributeAnd(node.left), right: distributeAnd(node.right) });
+      }
+      if (node.type === 'not') {
+        return new Node('not', { operand: distributeAnd(node.operand) });
+      }
+      return node;
+    }
+
+    /**
+     * Skolemiza a lista de quantificadores, substituindo quantificadores
+     * existenciais por funções de Skolem e removendo quantificadores
+     * universais. Retorna uma cópia da matriz com as substituições aplicadas.
+     */
+    function skolemize(quantifiers, matrix) {
+      let resultMatrix = matrix;
+      let universalVars = [];
+      quantifiers.forEach(q => {
+        if (q.type === 'forall') {
+          universalVars.push(q.var);
+        } else if (q.type === 'exists') {
+          // criar função de Skolem com os universais atuais como argumentos
+          const fname = newFun('f');
+          const skolemTerm = universalVars.length > 0
+            ? { type: 'function', name: fname, args: universalVars.map(v => ({ type: 'variable', name: v })) }
+            : { type: 'variable', name: fname }; // sem universais, usa constante
+          resultMatrix = substitute(resultMatrix, q.var, skolemTerm);
+        }
+      });
+      return resultMatrix;
+    }
+
+    /**
+     * Quebra uma fórmula em CNF em uma lista de cláusulas. Cada cláusula é
+     * representada como uma lista de literais (objetos com {negated:boolean,
+     * atom: Node}).
+     */
+    function extractClauses(node) {
+      // A CNF é uma conjunção de disjunções de literais
+      if (node.type === 'and') {
+        return [...extractClauses(node.left), ...extractClauses(node.right)];
+      }
+      // cláusula única
+      return [extractClause(node)];
+    }
+
+    function extractClause(node) {
+      // Uma cláusula é uma disjunção de literais
+      if (node.type === 'or') {
+        return [...extractClause(node.left), ...extractClause(node.right)];
+      }
+      if (node.type === 'not') {
+        return [{ negated: true, atom: node.operand }];
+      }
+      // átomo positivo
+      return [{ negated: false, atom: node }];
+    }
+
+    /**
+     * Verifica se uma CNF está na forma de cláusulas de Horn. Ou seja, cada
+     * cláusula possui no máximo um literal positivo.
+     */
+    function isHorn(clauses) {
+      return clauses.every(clause => {
+        let positives = 0;
+        clause.forEach(lit => {
+          if (!lit.negated) positives++;
+        });
+        return positives <= 1;
+      });
+    }
+
+    /**
+     * Converte um AST de volta para uma string em notação infixa amigável.
+     */
+    function toString(node) {
+      switch (node.type) {
+        case 'atom': {
+          if (node.args.length === 0) return node.name;
+          return node.name + '(' + node.args.map(toTermString).join(',') + ')';
+        }
+        case 'not':
+          return '¬' + toString(node.operand);
+        case 'and':
+          return '(' + toString(node.left) + ' ∧ ' + toString(node.right) + ')';
+        case 'or':
+          return '(' + toString(node.left) + ' ∨ ' + toString(node.right) + ')';
+        case 'implies':
+          return '(' + toString(node.left) + ' → ' + toString(node.right) + ')';
+        case 'iff':
+          return '(' + toString(node.left) + ' ↔ ' + toString(node.right) + ')';
+        case 'forall':
+          return '∀' + node.var + ' ' + toString(node.formula);
+        case 'exists':
+          return '∃' + node.var + ' ' + toString(node.formula);
+        default:
+          return '';
+      }
+    }
+
+    function toTermString(term) {
+      if (term.type === 'variable') return term.name;
+      if (term.type === 'function') {
+        return term.name + '(' + term.args.map(toTermString).join(',') + ')';
+      }
+      return '';
+    }
+
+    /**
+     * Gera uma string representando uma forma prenex com quantificadores
+     * prefixados.
+     */
+    function prenexToString(quantifiers, matrix) {
+      const prefix = quantifiers.map(q => (q.type === 'forall' ? '∀' : '∃') + q.var).join(' ');
+      return (prefix ? prefix + ' ' : '') + toString(matrix);
+    }
+
+    /**
+     * Converte uma lista de cláusulas em string legível: conjunção de
+     * disjunções de literais.
+     */
+    function clausesToString(clauses) {
+      return clauses.map(clause => {
+        return '(' + clause.map(lit => (lit.negated ? '¬' : '') + toString(lit.atom)).join(' ∨ ') + ')';
+      }).join(' ∧ ');
+    }
+
+    // ======== FUNÇÃO PRINCIPAL ========
+
+    function processFormula() {
+      const input = document.getElementById('input').value;
+      if (!input.trim()) return;
+      // Limpa saídas anteriores
+      document.getElementById('rendered').innerHTML = '';
+      document.getElementById('fncPrenex').innerHTML = '';
+      document.getElementById('fndPrenex').innerHTML = '';
+      document.getElementById('clausal').innerHTML = '';
+      document.getElementById('horn').innerHTML = '';
+      
+      try {
+        // Renderiza a fórmula original via MathJax
+        const renderDiv = document.getElementById('rendered');
+        renderDiv.innerHTML = '<span class="label">Fórmula digitada:</span><div id="latexContainer">\\(' + input + '\\)</div>';
+        if (window.MathJax) {
+          MathJax.typesetPromise([document.getElementById('latexContainer')]);
+        }
+        // Normaliza e tokeniza
+        const normalized = normalizeLatex(input);
+        const tokens = tokenize(normalized);
+        // Parse
+        let ast = parse(tokens);
+        // Elimina ↔ e →
+        ast = eliminateImplications(ast);
+        // Converte para NNF
+        ast = toNNF(ast);
+        // Standardiza variáveis
+        ast = standardize(ast);
+        // Conversão para forma prenex
+        const prenex = toPrenex(ast);
+        // Copia ast para DNF e CNF
+        const matrixNNF = prenex.matrix;
+        // Forma Normal Conjuntiva (FNC) Prenex
+        const cnfMatrix = toCNF(matrixNNF);
+        const fncString = prenexToString(prenex.quantifiers, cnfMatrix);
+        // Forma Normal Disjuntiva (FND) Prenex
+        const dnfMatrix = toDNF(matrixNNF);
+        const fndString = prenexToString(prenex.quantifiers, dnfMatrix);
+        // Skolemização e clausal form
+        const skolemMatrix = skolemize(prenex.quantifiers, matrixNNF);
+        const cnfSkolem = toCNF(skolemMatrix);
+        const clauses = extractClauses(cnfSkolem);
+        const clausalStr = clausesToString(clauses);
+        // Verificação Horn
+        const horn = isHorn(clauses);
+        // Preencher campos
+        document.getElementById('fncPrenex').innerHTML = '<span class="label">FNC Prenex:</span><div class="formula">' + escapeHTML(fncString) + '</div>';
+        document.getElementById('fndPrenex').innerHTML = '<span class="label">FND Prenex:</span><div class="formula">' + escapeHTML(fndString) + '</div>';
+        document.getElementById('clausal').innerHTML = '<span class="label">Forma Cláusal (Skolemizada):</span><div class="formula">' + escapeHTML(clausalStr) + '</div>';
+        document.getElementById('horn').innerHTML = '<span class="label">Cláusula de Horn:</span><div class="formula">' + (horn ? 'Sim' : 'Não') + '</div>';
+      } catch (e) {
+        const renderDiv = document.getElementById('rendered');
+        renderDiv.innerHTML = '<span style="color: red;">Erro: ' + escapeHTML(e.message) + '</span>';
+      }
+    }
+
+    /**
+     * Simples função para escapar HTML ao apresentar strings.
+     */
+    function escapeHTML(str) {
+      return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+  </script>
+</body>
+</html>
